@@ -14,6 +14,7 @@ vi.mock('../../../src/platform/spawn', async (importOriginal) => {
 
 import {
   buildBridgeSystemPrompt,
+  prefixCodexBridgeSystemPrompt,
   prefixBridgeSystemPrompt,
 } from '../../../src/agent/bridge-system-prompt';
 import { ClaudeAdapter } from '../../../src/agent/claude/adapter';
@@ -99,7 +100,7 @@ describe('CodexAdapter system prompt wiring', () => {
 
     const stdin = await readAll(child.stdin);
     expect(stdin).toBe(
-      prefixBridgeSystemPrompt('hi', { openId: 'ou_bot_self', name: 'Bridge' }),
+      prefixCodexBridgeSystemPrompt('hi', { openId: 'ou_bot_self', name: 'Bridge' }),
     );
   });
 
@@ -111,7 +112,7 @@ describe('CodexAdapter system prompt wiring', () => {
     adapter.run({ runId: 'r1', prompt: 'hi', cwd: '/tmp' });
 
     const stdin = await readAll(child.stdin);
-    expect(stdin).toBe(prefixBridgeSystemPrompt('hi', undefined));
+    expect(stdin).toBe(prefixCodexBridgeSystemPrompt('hi', undefined));
   });
 });
 

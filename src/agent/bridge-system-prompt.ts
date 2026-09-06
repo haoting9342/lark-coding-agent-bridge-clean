@@ -128,6 +128,18 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 7. 如果用户中途想取消，他们会发 \`/stop\`——那时被 kill 是预期行为，不用兜底。
 `;
 
+export const CODEX_BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
+
+你在 bridge 进程中运行。使用 stdin 中结构化的 bridge_context、引用、卡片和 topic_context 作为事实来源。
+
+- 保留 LARK_CHANNEL、LARK_CHANNEL_HOME、LARK_CHANNEL_PROFILE、LARK_CHANNEL_CONFIG、LARKSUITE_CLI_CONFIG_DIR，不要 unset 或绕回普通 profile。
+- lark-cli 提示未绑定时停止并要求重启 bridge 或运行 doctor/preflight；不要读取密钥或自行 bind。
+- 飞书授权只在 p2p 中按需使用前台阻塞的 \`lark-cli auth login\`。
+- 只有用户明确要求时才真实 @ 其他 bot；不要模仿 bridge 元数据标注。
+- 交互卡片回调的 value 必须包含 \`__bridge_cb: true\` 和有效的 bridge 签名 token，不能猜测或伪造。
+- 直接完成简单的 shell、文件和代码任务，只有确实需要时才扫描额外工作区文件。
+`;
+
 /**
  * Compose the bridge system prompt, appending a concrete self-identity line
  * when the bot's IM identity is known. Falls back to the base prompt (which
@@ -145,4 +157,11 @@ export function prefixBridgeSystemPrompt(
   identity: AgentBotIdentity | undefined,
 ): string {
   return `${buildBridgeSystemPrompt(identity)}\n\n## user_message\n\n${prompt}`;
+}
+
+export function prefixCodexBridgeSystemPrompt(prompt: string, identity: AgentBotIdentity | undefined): string {
+  const identityLine = identity?.openId
+    ? `\n## 你的身份\n\n你的 open_id 是 \`${identity.openId}\`${identity.name ? `，名字是「${identity.name}」` : ''}。\n`
+    : '';
+  return `${CODEX_BRIDGE_SYSTEM_PROMPT}${identityLine}\n## user_message\n\n${prompt}`;
 }

@@ -179,7 +179,7 @@ async function normalizeItemToQuoted(
 export async function fetchTopicContext(
   channel: LarkChannel,
   threadId: string,
-  opts: { maxMessages: number; excludeIds?: Set<string> },
+  opts: { maxMessages: number; maxChars?: number; excludeIds?: Set<string> },
 ): Promise<QuotedContext[]> {
   const collected: ApiMessageItem[] = [];
   let pageToken: string | undefined;
@@ -210,11 +210,19 @@ export async function fetchTopicContext(
   }
 
   const exclude = opts.excludeIds ?? new Set<string>();
-  const relevant = collected
+  const candidates = collected
     .filter(
       (m) => m.message_id && !exclude.has(m.message_id) && !(m as { deleted?: boolean }).deleted,
     )
     .slice(-opts.maxMessages);
+  const maxChars = opts.maxChars ?? 24000;
+  let chars = 0;
+  const relevant = candidates.slice().reverse().filter((item) => {
+    const itemChars = typeof item.body?.content === 'string' ? item.body.content.length : 0;
+    if (chars > 0 && chars + itemChars > maxChars) return false;
+    chars += itemChars;
+    return true;
+  }).reverse();
 
   const out: QuotedContext[] = [];
   for (const item of relevant) {

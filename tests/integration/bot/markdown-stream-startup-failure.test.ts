@@ -464,7 +464,9 @@ async function createHarness(options: {
     codex: {
       binaryPath: '/usr/local/bin/codex',
     },
-    ...(options.messageReply ? { preferences: { messageReply: options.messageReply } } : {}),
+    // This suite exercises the explicitly selected markdown/card stream paths.
+    // Empty Codex preferences are covered by managed-process-card.test.ts.
+    preferences: { messageReply: options.messageReply ?? 'markdown' },
   });
   const profileConfig = {
     ...baseProfileConfig,

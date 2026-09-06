@@ -69,21 +69,46 @@ export async function updateManagedCard(
     throw new Error(`no managed card registered for message ${messageId}`);
   }
   entry.sequence += 1;
-  try {
-    if (entry.kind === 'card-id') {
-      await channel.updateCardById(entry.cardId!, card, entry.sequence);
-    } else {
-      await channel.updateCard(messageId, card);
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      if (entry.kind === 'card-id') {
+        await channel.updateCardById(entry.cardId!, card, entry.sequence);
+      } else {
+        await channel.updateCard(messageId, card);
+      }
+      if (attempt > 1) {
+        log.info('card', 'managed-update-recovered', {
+          attempt,
+          kind: entry.kind,
+          cardId: entry.cardId,
+          seq: entry.sequence,
+        });
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < 3) {
+        const delayMs = 250 * attempt;
+        log.warn('card', 'managed-update-retry', {
+          attempt,
+          delayMs,
+          kind: entry.kind,
+          cardId: entry.cardId,
+          seq: entry.sequence,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
     }
-  } catch (err) {
-    log.fail('card', err, {
-      step: 'managed-update',
-      kind: entry.kind,
-      cardId: entry.cardId,
-      seq: entry.sequence,
-    });
-    throw err;
   }
+  log.fail('card', lastErr, {
+    step: 'managed-update',
+    kind: entry.kind,
+    cardId: entry.cardId,
+    seq: entry.sequence,
+  });
+  throw lastErr;
 }
 
 /** True iff we have the card_id mapping for this messageId. */

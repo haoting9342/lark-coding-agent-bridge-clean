@@ -19,6 +19,13 @@ describe('agent model catalog', () => {
     expect(claude.map((m) => m.value)).not.toContain('gpt-5-codex');
   });
 
+  it('offers GPT-6 Astra in the Codex picker', () => {
+    const codex = supportedModels('codex');
+    expect(codex.map((m) => m.value)).toContain('gpt-6-astra');
+    expect(modelLabel('codex', 'gpt-6-astra')).toContain('GPT-6');
+    expect(resolveModelArg('codex', 'gpt-6-astra')).toBe('gpt-6-astra');
+  });
+
   it('treats unset and the default sentinel as "use agent default"', () => {
     expect(isDefaultModel(undefined)).toBe(true);
     expect(isDefaultModel('')).toBe(true);

@@ -18,6 +18,7 @@ import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
+import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -79,12 +80,6 @@ const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 
-const BRIDGE_AGENT_INSTRUCTIONS = [
-  '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
-  '不要 unset LARK_CHANNEL / LARK_CHANNEL_HOME / LARK_CHANNEL_PROFILE / LARKSUITE_CLI_CONFIG_DIR，也不要用 env -u LARK_CHANNEL 绕回本机普通配置。',
-  'Codex bridge 默认使用 danger-full-access 对齐 Claude bridge 的 bypassPermissions 行为，因此 lark-cli 应能像用户本机终端一样访问 keychain。',
-  '如果提示 lark-channel context detected but not bound，停止当前操作并请用户重启 bridge 或运行 bridge doctor/preflight；不要改用普通 profile，不要自行 bind，也不要直接读取 config.json 里的账号或密钥。',
-];
 
 // Lark SDK logs API errors at error level even when the caller catches them.
 // These specific codes are EXPECTED in our flow (wiki-node lookup that
@@ -882,6 +877,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     const exclude = new Set([...batchIds, ...quoteTargets]);
     topicContext = await fetchTopicContext(channel, threadId, {
       maxMessages: 40,
+      maxChars: 24000,
       excludeIds: exclude,
     });
     if (topicContext.length > 0) {
@@ -1041,9 +1037,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   }
 
   const replyMode = getMessageReplyMode(controls.cfg);
-  log.info('flush', 'reply-mode', { mode: replyMode });
+  const effectiveReplyMode =
+    controls.profileConfig.agentKind === 'codex' &&
+    replyMode === 'markdown' &&
+    controls.cfg.preferences?.messageReply === undefined
+      ? 'managed-card'
+      : replyMode;
+  log.info('flush', 'reply-mode', { mode: replyMode, effectiveMode: effectiveReplyMode });
   const cotMessages = getCotMessages(controls.cfg);
-  const cotEnabled = cotMessages !== 'off';
+  const cotEnabled = effectiveReplyMode !== 'managed-card' && cotMessages !== 'off';
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
@@ -1071,7 +1073,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // Add a "Typing" reaction to the triggering message as an instant ack, but
   // never let that outbound API call block agent event draining.
   const reactionPromise =
-    cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
+    cotEnabled || effectiveReplyMode === 'card' || effectiveReplyMode === 'managed-card'
+      ? undefined
+      : addWorkingReaction(channel, lastMsg.messageId);
 
   try {
     if (cotEnabled) {
@@ -1124,7 +1128,77 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
     }
 
-    if (replyMode === 'card') {
+    if (effectiveReplyMode === 'managed-card') {
+      const { messageId: processMessageId } = await sendManagedCard(
+        channel,
+        chatId,
+        renderCard(initialState, cardRenderOptions),
+        sendOpts,
+      );
+      let lastProcessCardUpdateSucceeded = true;
+      let finalState: RunState;
+      try {
+        finalState = await processAgentStream(
+          handle,
+          eventStream,
+          scope,
+          idleTimeoutMs,
+          recordSession,
+          async (state) => {
+            try {
+              await updateManagedCard(
+                channel,
+                processMessageId,
+                renderCard(filterForPrefs(state), cardRenderOptions),
+              );
+              lastProcessCardUpdateSucceeded = true;
+            } catch (err) {
+              lastProcessCardUpdateSucceeded = false;
+              log.warn('card', 'process-card-update-degraded', {
+                scope,
+                messageId: processMessageId,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+          },
+        );
+
+        const visibleFinalState = filterForPrefs(finalState);
+        if (visibleFinalState.terminal === 'done') {
+          try {
+            await channel.recallMessage(processMessageId);
+            log.info('card', 'process-card-recalled', { scope, messageId: processMessageId });
+          } catch (err) {
+            log.warn('card', 'process-card-recall-failed', {
+              scope,
+              messageId: processMessageId,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+          await sendFinalReply({
+            channel,
+            chatId,
+            scope,
+            state: finalAnswerOnlyState(visibleFinalState),
+            replyMode,
+            sendOpts,
+            cardRenderOptions,
+          });
+        } else if (!lastProcessCardUpdateSucceeded) {
+          await sendFinalReply({
+            channel,
+            chatId,
+            scope,
+            state: finalAnswerOnlyState(visibleFinalState),
+            replyMode,
+            sendOpts,
+            cardRenderOptions,
+          });
+        }
+      } finally {
+        forgetManagedCard(processMessageId);
+      }
+    } else if (replyMode === 'card') {
       let latestState: RunState = initialState;
       let producerStarted = false;
       let cardCtrl:
@@ -1846,10 +1920,7 @@ function buildPrompt(
       messageIds: batch.map((m) => m.messageId),
       source: 'im',
     },
-    instructions:
-      extraInstructions && extraInstructions.length > 0
-        ? [...BRIDGE_AGENT_INSTRUCTIONS, ...extraInstructions]
-        : BRIDGE_AGENT_INSTRUCTIONS,
+    ...(extraInstructions && extraInstructions.length > 0 ? { instructions: extraInstructions } : {}),
     userInput: userPart,
     ...(topicContext.length > 0 ? { topicContext: topicContext.map(toPromptTopicMessage) } : {}),
     quotedMessages: quotes.map(toPromptQuote),

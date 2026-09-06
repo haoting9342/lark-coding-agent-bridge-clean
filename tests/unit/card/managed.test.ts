@@ -1,5 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { sendManagedCard, updateManagedCard } from '../../../src/card/managed.js';
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe('managed card sending', () => {
   it('falls back to sending the raw card when the card_id message is rejected', async () => {
@@ -45,6 +49,58 @@ describe('managed card sending', () => {
 
     expect(channel.updateCardById).toHaveBeenCalledWith('card_normal', { body: 'cancelled' }, 1);
     expect(channel.updateCard).not.toHaveBeenCalled();
+  });
+
+  it('retries a card-id update twice and preserves its sequence before recovering', async () => {
+    vi.useFakeTimers();
+    const channel = {
+      createCard: vi.fn(async () => ({ cardId: 'card_retry' })),
+      send: vi.fn(async () => ({ messageId: 'om_retry' })),
+      updateCardById: vi.fn()
+        .mockRejectedValueOnce(new Error('temporary failure 1'))
+        .mockRejectedValueOnce(new Error('temporary failure 2'))
+        .mockResolvedValueOnce(undefined),
+      updateCard: vi.fn(async () => {}),
+    };
+
+    await sendManagedCard(channel as never, 'oc_chat', { body: 'form' });
+    const update = updateManagedCard(channel as never, 'om_retry', { body: 'progress' })
+      .catch((error: unknown) => error);
+    await vi.runAllTimersAsync();
+    expect(await update).toBeUndefined();
+
+    expect(channel.updateCardById).toHaveBeenCalledTimes(3);
+    expect(channel.updateCardById.mock.calls).toEqual([
+      ['card_retry', { body: 'progress' }, 1],
+      ['card_retry', { body: 'progress' }, 1],
+      ['card_retry', { body: 'progress' }, 1],
+    ]);
+  });
+
+  it('rejects after three card-id update attempts with the same sequence', async () => {
+    vi.useFakeTimers();
+    const finalError = new Error('persistent failure');
+    const channel = {
+      createCard: vi.fn(async () => ({ cardId: 'card_exhausted' })),
+      send: vi.fn(async () => ({ messageId: 'om_exhausted' })),
+      updateCardById: vi.fn(async () => {
+        throw finalError;
+      }),
+      updateCard: vi.fn(async () => {}),
+    };
+
+    await sendManagedCard(channel as never, 'oc_chat', { body: 'form' });
+    const update = updateManagedCard(channel as never, 'om_exhausted', { body: 'progress' })
+      .catch((error: unknown) => error);
+    await vi.runAllTimersAsync();
+    expect(await update).toBe(finalError);
+
+    expect(channel.updateCardById).toHaveBeenCalledTimes(3);
+    expect(channel.updateCardById.mock.calls).toEqual([
+      ['card_exhausted', { body: 'progress' }, 1],
+      ['card_exhausted', { body: 'progress' }, 1],
+      ['card_exhausted', { body: 'progress' }, 1],
+    ]);
   });
 
   it('updates raw-card fallback messages by message id', async () => {

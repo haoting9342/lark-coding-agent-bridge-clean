@@ -100,13 +100,11 @@ describe('agent prompt builder', () => {
   });
 
   it('keeps bridge agents inside the current lark-channel profile by default', () => {
-    const source = readFileSync(join(process.cwd(), 'src/bot/channel.ts'), 'utf8');
+    const source = readFileSync(join(process.cwd(), 'src/agent/bridge-system-prompt.ts'), 'utf8');
 
     expect(source).not.toContain('命令必须写成 env -u LARK_CHANNEL');
     expect(source).not.toContain('env -u LARK_CHANNEL lark-cli');
-    expect(source).toContain('danger-full-access');
-    expect(source).toContain('bypassPermissions');
-    expect(source).toContain('不要 unset LARK_CHANNEL');
+    expect(source).toContain('不要 unset');
     expect(source).toContain('LARKSUITE_CLI_CONFIG_DIR');
     expect(source).not.toContain('lark-cli config bind --source lark-channel');
   });
