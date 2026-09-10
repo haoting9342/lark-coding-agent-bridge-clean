@@ -102,6 +102,8 @@ describe('CodexAdapter system prompt wiring', () => {
     expect(stdin).toBe(
       prefixCodexBridgeSystemPrompt('hi', { openId: 'ou_bot_self', name: 'Bridge' }),
     );
+    expect(stdin).toContain('可使用 Codex 的 `command_execution` 工具');
+    expect(stdin).toContain('不表示工具不存在或不可用');
   });
 
   it('falls back to the base system prompt when no identity was set', async () => {
