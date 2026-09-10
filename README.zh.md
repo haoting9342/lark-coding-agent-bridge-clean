@@ -354,3 +354,15 @@ export default createAdapter;
 [MIT](./LICENSE)
 
 <img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
+
+### Codex provider switching
+
+Owner/admin private chats only: `/provider` or `/provider status` reports the current login source; `/provider api` selects the saved token.brioi.com API key; `/provider chatgpt` selects the saved ChatGPT account.
+
+Requires a dedicated `profiles/<profile>/provider-codex-home` injected as the bridge service CODEX_HOME. Shared homes cannot be switched. Active or draining agent children block switching; new runs pause during the transaction. Credentials are stored separately under bridge-providers (directory 700, files 600), with backup and durable interrupted-transaction recovery before the next run. No history repair or deletion. Source credentials must be initialized locally on the server, never sent in Feishu messages. Successful mode readback is distinct from upstream inference verification.
+
+`/provider api` 和 `/provider chatgpt` 仅切换登录源，不扫描历史会话。命令仅限管理员私聊，运行任务或 Codex 子进程尚未退出时拒绝切换。
+
+飞书独立 Codex 目录中的旧会话若在执行时遇到明确的 `item_` ID 前缀兼容性错误，bridge 会等失败进程退出，提示“正在修复当前会话”，只备份修复当前会话，然后用同一条指令、模型和附件自动重试一次。已经产生工具操作或回答的任务不自动重放，其他错误不触发修复。用户停止任务时不再重试。
+
+修复只移除旧 `response_item.payload.id` 的不兼容 `item_` ID，保留消息、工具调用关联和文件字节位置。原文件保存在独立目录 `bridge-providers/history-backups/` 下；不扫描其他会话内容、不修改 Goblin 共享 `~/.codex` 或其他 CLI。若修复或重试无法完成，显示简短失败说明，不无限重试。

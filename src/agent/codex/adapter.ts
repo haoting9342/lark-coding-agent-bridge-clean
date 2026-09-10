@@ -1,6 +1,10 @@
+import { lstat } from 'node:fs/promises';
+import { repairCodexHistory } from '../../runtime/codex-history-repair';
+import { homedir } from 'node:os';
+import { recoverProviderSwitch } from '../../runtime/codex-provider';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { SandboxMode } from '../../config/profile-schema';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
@@ -45,6 +49,9 @@ export class CodexAdapter implements AgentAdapter {
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly runningChildren = new Set<CodexChild>();
+  private readonly childThreads = new Map<CodexChild, string>();
+  private readonly repairingThreads = new Set<string>();
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: CodexAdapterOptions) {
@@ -63,6 +70,14 @@ export class CodexAdapter implements AgentAdapter {
     this.botIdentity = identity;
   }
 
+  hasRunningProcesses(): boolean { return this.runningChildren.size > 0; }
+
+  private effectiveHome(): string {
+    return this.codexHome ?? (this.inheritCodexHome
+      ? process.env.CODEX_HOME ?? join(homedir(), '.codex')
+      : join(this.profileStateDir, 'codex-home'));
+  }
+
   async isAvailable(): Promise<boolean> {
     return (await this.checkAvailability()).ok;
   }
@@ -77,6 +92,7 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async prepareRun(): Promise<void> {
+    await recoverProviderSwitch(this.effectiveHome());
     const availability = await this.checkAvailability();
     if (!availability.ok) {
       throw new SpawnFailed(
@@ -89,6 +105,58 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   run(opts: AgentRunOptions): AgentRun {
+    if (opts.threadId && this.repairingThreads.has(opts.threadId)) throw new Error('当前会话正在修复，请稍后重试。');
+    let outputStarted = false;
+    let current = this.runOnce(opts, () => { outputStarted = true; });
+    let stopped = false;
+    const adapter = this;
+    return {
+      runId: opts.runId,
+      async stop() { stopped = true; await current.stop(); },
+      waitForExit(timeoutMs) { return current.waitForExit(timeoutMs); },
+      events: (async function* (): AsyncGenerator<AgentEvent> {
+        for await (const event of current.events) {
+          if (event.type === 'tool_use' || event.type === 'tool_result' || event.type === 'text' || event.type === 'final_text') outputStarted = true;
+          const home = adapter.effectiveHome();
+          const eligible = event.type === 'error' && event.terminationReason === 'failed' && !outputStarted && !stopped
+            && opts.threadId && isHistoryIdCompatibilityError(event.message)
+            && resolve(home) === resolve(join(adapter.profileStateDir, 'provider-codex-home'));
+          if (!eligible) { yield event; continue; }
+          // Finish the failed writer before touching its rollout; keep the logical run active.
+          if (!await current.waitForExit(5000)) { await current.stop(); }
+          if (!await current.waitForExit(1000)) { yield event; return; }
+          if (stopped) { yield { type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' }; return; }
+          const threadId = opts.threadId!;
+          if ([...adapter.childThreads.values()].includes(threadId) || adapter.repairingThreads.has(threadId)) {
+            yield { type: 'error', message: '当前会话仍有其他任务运行，暂时无法自动修复。请稍后重试。', terminationReason: 'failed' }; return;
+          }
+          adapter.repairingThreads.add(threadId);
+          try {
+            if ((await lstat(home)).isSymbolicLink()) throw new Error('Linked home');
+            yield { type: 'text', delta: '正在修复当前会话，完成后继续原指令。\n\n' };
+            if (!stopped) {
+              const result = await repairCodexHistory(home, threadId);
+              if (!result.removedIds) throw new Error('No compatible repair found');
+              log.info('agent', 'history-repaired', { threadId, files: result.files, removedIds: result.removedIds, backupDir: result.backupDir });
+            }
+          } catch {
+            yield { type: 'error', message: '当前会话未能安全修复，原指令尚未继续。请检查该会话的历史备份。', terminationReason: 'failed' }; return;
+          } finally { adapter.repairingThreads.delete(threadId); }
+          if (stopped) { yield { type: 'done', threadId, terminationReason: 'interrupted' }; return; }
+          current = adapter.runOnce(opts);
+          // A single retry bounds recovery and prevents loops on a different upstream problem.
+          for await (const retried of current.events) {
+            if (retried.type === 'error' && isHistoryIdCompatibilityError(retried.message)) {
+              yield { type: 'error', message: '会话修复后仍未能继续，已停止自动重试；原指令尚未完成。', terminationReason: 'failed' };
+            } else yield retried;
+          }
+          return;
+        }
+      })(),
+    };
+  }
+
+  private runOnce(opts: AgentRunOptions, onActivity?: () => void): AgentRun {
     if (!opts.cwd) {
       throw new Error('cwd is required for CodexAdapter.run');
     }
@@ -113,6 +181,13 @@ export class CodexAdapter implements AgentAdapter {
       env: mergeProcessEnv(process.env, envOverrides),
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as CodexChild;
+
+    this.runningChildren.add(child);
+    if (opts.threadId) this.childThreads.set(child, opts.threadId);
+    child.once('exit', () => this.childThreads.delete(child));
+    child.once('error', () => { if (!child.pid) this.childThreads.delete(child); });
+    child.once('exit', () => this.runningChildren.delete(child));
+    child.once('error', () => { if (!child.pid) this.runningChildren.delete(child); });
 
     log.info('agent', 'spawn', {
       pid: child.pid ?? null,
@@ -159,7 +234,7 @@ export class CodexAdapter implements AgentAdapter {
 
     return {
       runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
+      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason, onActivity),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         stopReason = 'interrupted';
@@ -208,6 +283,7 @@ async function* createEventStream(
   stderrChunks: Buffer[],
   getError: () => Error | null,
   getStopReason: () => CodexFinishReason | undefined,
+  onActivity?: () => void,
 ): AsyncGenerator<AgentEvent> {
   const translator = new CodexJsonlTranslator();
   if (!child.pid) {
@@ -240,6 +316,10 @@ async function* createEventStream(
       } catch {
         continue;
       }
+      // Some Codex tool item types are not rendered by the translator yet.
+      // Still count them as activity so recovery cannot replay their effects.
+      const raw = parsed as { type?: string; item?: { type?: string } } | null;
+      if (raw && (raw.type === 'item.started' || raw.type === 'item.completed') && raw.item?.type !== 'reasoning') onActivity?.();
       yield* translator.translate(parsed);
     }
   } finally {
@@ -292,4 +372,8 @@ function isWindowsCommandNotFoundLine(line: string): boolean {
     process.platform === 'win32' &&
     /is not recognized as an internal or external command|operable program or batch file/i.test(line)
   );
+}
+
+export function isHistoryIdCompatibilityError(message: string): boolean {
+  return /Invalid\s+['"]input\[\d+\]\.id['"][\s\S]*?['"]item_[a-z0-9]+['"][\s\S]*?Expected an ID that begins with ['"][a-z]+_?['"]/i.test(message);
 }

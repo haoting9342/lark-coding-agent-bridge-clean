@@ -1,7 +1,8 @@
+import { getProviderStatus, switchProvider, ProviderSwitchError } from '../runtime/codex-provider';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
@@ -175,6 +176,7 @@ const handlers: Record<string, Handler> = {
   '/status': handleStatus,
   '/help': handleHelp,
   '/account': handleAccount,
+  '/provider': handleProvider,
   '/config': handleConfig,
   '/stop': handleStop,
   '/timeout': handleTimeout,
@@ -194,6 +196,7 @@ const handlers: Record<string, Handler> = {
  * owner is always allowed, while empty admin list means no listed admins.
  */
 const ADMIN_COMMANDS = new Set([
+  '/provider',
   '/account',
   '/config',
   '/ps',
@@ -807,6 +810,54 @@ async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' 
     return 'user-missing';
   }
   return 'app';
+}
+
+async function handleProvider(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.msg.chatType !== 'p2p') {
+    await reply(ctx, '❌ /provider 仅限私聊使用。');
+    return;
+  }
+  if (ctx.agent.id !== 'codex') {
+    await reply(ctx, '此命令仅适用于 Codex。');
+    return;
+  }
+  const action = args.trim().toLowerCase();
+  if (!['', 'status', 'api', 'chatgpt'].includes(action)) {
+    await reply(ctx, '用法：/provider 查看当前登录方式；/provider api 或 /provider chatgpt 切换登录源。');
+    return;
+  }
+  const codex = ctx.controls.profileConfig.codex;
+  const home = codex?.codexHome ?? (codex?.inheritCodexHome === false
+    ? join(commandProfilePaths(ctx).profileDir, 'codex-home')
+    : process.env.CODEX_HOME ?? join(homedir(), '.codex'));
+  let release: (() => void) | undefined;
+  try {
+    if (action === '' || action === 'status') {
+      const current = await getProviderStatus(home);
+      await reply(ctx, `当前登录方式：${current.label}\n\n/provider api — API Key\n/provider chatgpt — ChatGPT 账号`);
+      return;
+    }
+    const isolatedHome = join(commandProfilePaths(ctx).profileDir, 'provider-codex-home');
+    if (resolve(home) !== resolve(isolatedHome)) {
+      await reply(ctx, '尚未配置飞书独立的 Codex 登录目录，拒绝修改共享登录源。');
+      return;
+    }
+    if (ctx.activeRuns.newRunsPaused()) {
+      await reply(ctx, '当前正在处理其他切换或重连，请稍后重试。');
+      return;
+    }
+    release = ctx.activeRuns.pauseNewRuns('正在切换 Codex 登录源，请稍后重试。');
+    if (ctx.activeRuns.snapshot().length > 0 || ctx.agent.hasRunningProcesses?.()) {
+      await reply(ctx, '当前 bridge 有任务正在运行，未切换。请等任务结束后重试。');
+      return;
+    }
+    const current = await switchProvider(home, action as 'api' | 'chatgpt');
+    await reply(ctx, `已切换。当前登录方式：${current.label}\n下一条任务使用此登录源；遇到历史 ID 兼容性问题时自动修复当前会话并继续。`);
+  } catch (error) {
+    await reply(ctx, error instanceof ProviderSwitchError
+      ? error.message
+      : '登录源操作失败，请检查服务器配置与凭据；未确认切换成功。');
+  } finally { release?.(); }
 }
 
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {

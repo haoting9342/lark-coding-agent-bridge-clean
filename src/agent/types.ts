@@ -80,6 +80,8 @@ export interface AgentAdapter {
   readonly id: string;
   readonly displayName: string;
   isAvailable(): Promise<boolean>;
+  /** Includes children draining after the visible run has finished. */
+  hasRunningProcesses?(): boolean;
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;

@@ -17,7 +17,7 @@ export default defineConfig([
     },
   },
   {
-    entry: { index: 'src/index.ts' },
+    entry: { index: 'src/index.ts', 'codex-provider': 'src/runtime/codex-provider.ts' },
     outDir: 'dist',
     format: ['esm'],
     target: 'node20',
