@@ -1526,11 +1526,23 @@ async function sendFinalReply(input: {
 }): Promise<void> {
   const body = renderText(input.state);
 
-  // Nothing deliverable to send (agent produced no text on a clean finish;
-  // error/interrupt/timeout keep `body` non-empty via their notices). Skip
-  // rather than post an empty card that renders as "(no content)".
+  // A clean terminal state can still have no deliverable text when the
+  // upstream stream drops after tool activity or a resumed thread returns an
+  // empty turn. The process card is recalled in that case; send a visible
+  // fallback so the user is never left with no reply.
   if (!body.trim()) {
-    log.info('outbound', 'skip-empty', { scope: input.scope, mode: input.replyMode });
+    const notice = '⚠️ 本次运行没有返回可显示的最终内容，过程卡已回收。请重试。';
+    const result = await input.channel.send(
+      input.chatId,
+      { markdown: notice },
+      input.sendOpts,
+    );
+    requireMessageReceipt(result, 'empty-final-fallback');
+    log.warn('outbound', 'empty-final-fallback', {
+      scope: input.scope,
+      mode: input.replyMode,
+      messageId: result.messageId,
+    });
     return;
   }
 

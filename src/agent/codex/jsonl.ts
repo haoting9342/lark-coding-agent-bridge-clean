@@ -152,10 +152,24 @@ export class CodexJsonlTranslator {
   }
 
   private translateTurnCompleted(raw: Record<string, unknown>): AgentEvent[] {
+    const finalMessage = this.pendingAgentMessage?.trim();
+    if (!finalMessage && this.lastNonTerminalError) {
+      this.terminal = true;
+      return [
+        {
+          type: 'error',
+          message: truncate(
+            `codex stream failed before a usable final response: ${this.lastNonTerminalError}`,
+            4096,
+          ),
+          terminationReason: 'failed',
+        },
+      ];
+    }
     this.terminal = true;
     const events: AgentEvent[] = [];
-    if (this.pendingAgentMessage) {
-      events.push({ type: 'final_text', content: this.pendingAgentMessage });
+    if (finalMessage) {
+      events.push({ type: 'final_text', content: finalMessage });
       this.pendingAgentMessage = undefined;
     }
     const usage = recordValue(raw.usage);

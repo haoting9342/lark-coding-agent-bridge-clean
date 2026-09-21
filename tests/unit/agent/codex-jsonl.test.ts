@@ -204,6 +204,20 @@ describe('Codex JSONL translator', () => {
     ]);
   });
 
+  it('surfaces a raw stream error when the retry ends with no usable final response', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(t.translate({ type: 'error', message: 'Our servers are currently overloaded. Please try again later.' })).toEqual([]);
+    expect(t.translate({ type: 'agent_message', message: '  ' })).toEqual([]);
+    expect(t.translate({ type: 'turn.completed' })).toEqual([
+      {
+        type: 'error',
+        message: 'codex stream failed before a usable final response: Our servers are currently overloaded. Please try again later.',
+        terminationReason: 'failed',
+      },
+    ]);
+  });
+
   it('still treats turn.failed as terminal after a raw error event', () => {
     const t = new CodexJsonlTranslator();
 
