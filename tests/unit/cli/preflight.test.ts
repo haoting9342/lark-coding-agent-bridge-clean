@@ -757,7 +757,9 @@ describe('lark-cli preflight', () => {
       ['config', 'default-as', 'auto'],
       ['config', 'show'],
     ]);
-    expect(mocks.calls[0]?.env?.LARKSUITE_CLI_CONFIG_DIR).toBeUndefined();
+    // A bridge process must preserve its profile-scoped lark-cli directory.
+    // In a standalone test process this remains undefined.
+    expect(mocks.calls[0]?.env?.LARKSUITE_CLI_CONFIG_DIR).toBe(process.env.LARKSUITE_CLI_CONFIG_DIR);
     expect(mocks.calls[1]?.env).toMatchObject({
       LARKSUITE_CLI_CONFIG_DIR: appPaths.larkCliConfigDir,
     });

@@ -6,6 +6,7 @@ import { tryHandleCommand, runCommandHandler, type CommandContext } from '../../
 import { ActiveRuns } from '../../../src/bot/active-runs';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema';
 import { createFakeChannel } from '../../helpers/fake-channel';
+import { SessionCatalog } from '../../../src/session/catalog';
 const dirs:string[]=[];
 afterEach(async()=>{await Promise.all(dirs.splice(0).map(d=>rm(d,{recursive:true,force:true})));});
 async function fixture(content='/provider',chatType='p2p',senderId='owner'){
@@ -26,6 +27,21 @@ it('rejects non-admin DMs',async()=>{const h=await fixture('/provider chatgpt','
 it('group card invocation cannot bypass private restriction',async()=>{const h=await fixture('/provider','group');await runCommandHandler('provider','chatgpt',h.ctx);expect(h.text()).toContain('仅限私聊');});
 it('refuses active work in another chat',async()=>{const h=await fixture('/provider chatgpt');h.activeRuns.register('other',{} as never);await tryHandleCommand(h.ctx);expect(h.text()).toContain('正在运行');expect(h.activeRuns.newRunsPaused()).toBe(false);});
 it('switches and reports actual new login mode',async()=>{const h=await fixture('/provider chatgpt');await tryHandleCommand(h.ctx);expect(h.text()).toContain('已切换');expect(h.text()).toContain('ChatGPT 账号');expect(h.activeRuns.newRunsPaused()).toBe(false);expect(await readFile(join(h.home,'auth.json'),'utf8')).not.toContain('fake-secret');});
+
+it('keeps all Codex sessions available after a provider switch', async () => {
+ const h=await fixture('/provider chatgpt');
+ const catalog = new SessionCatalog(join(h.home, 'catalog.json'));
+ catalog.upsertActive({scopeId:'group-a',agentId:'codex',cwdRealpath:'/repo/a',policyFingerprint:'fp-a',threadId:'thread-a'});
+ catalog.upsertActive({scopeId:'group-b',agentId:'codex',cwdRealpath:'/repo/b',policyFingerprint:'fp-b',threadId:'thread-b'});
+ catalog.upsertActive({scopeId:'claude',agentId:'claude',cwdRealpath:'/repo/c',policyFingerprint:'fp-c',sessionId:'session-c'});
+ h.ctx.sessionCatalog = catalog;
+ await tryHandleCommand(h.ctx);
+ expect(catalog.entries().filter((entry) => entry.status === 'active')).toEqual([
+   expect.objectContaining({agentId:'codex',threadId:'thread-a'}),
+   expect.objectContaining({agentId:'codex',threadId:'thread-b'}),
+   expect.objectContaining({agentId:'claude',sessionId:'session-c'}),
+ ]);
+});
 
 it('never switches shared Codex home',async()=>{const h=await fixture('/provider chatgpt');h.ctx.controls.profileConfig.codex!.codexHome=h.home+'/../shared';await tryHandleCommand(h.ctx);expect(h.text()).toContain('飞书独立');});
 it('refuses draining CLI children after ActiveRuns is cleared',async()=>{const h=await fixture('/provider chatgpt');Object.assign(h.ctx.agent,{hasRunningProcesses:()=>true});await tryHandleCommand(h.ctx);expect(h.text()).toContain('正在运行');expect(await readFile(join(h.home,'auth.json'),'utf8')).toContain('fake-secret');});

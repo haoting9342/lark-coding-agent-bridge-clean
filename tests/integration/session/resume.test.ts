@@ -121,6 +121,30 @@ describe('agent-aware run-flow resume', () => {
     });
   });
 
+  it('resumes the same Codex thread after the selected model changes', async () => {
+    const h = await createHarness('codex');
+    const first = await start(h);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('expected initial run');
+    await collect(first.execution.subscribe());
+    h.catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: first.cwdRealpath,
+      policyFingerprint: first.policy.policyFingerprint,
+      threadId: 'thread-old-model',
+      now: 1000,
+    });
+    h.profileConfig.preferences.model = 'gpt-6.1-sol';
+
+    const second = await start(h);
+
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error('expected resumed run');
+    expect(second.resumeFrom).toBe('thread-old-model');
+    expect(h.agent.runOptions[1]).toMatchObject({ threadId: 'thread-old-model', model: 'gpt-6.1-sol' });
+  });
+
   it('records system session identifiers into the agent-aware catalog', async () => {
     const claude = await createHarness('claude');
     const claudeRun = await start(claude);

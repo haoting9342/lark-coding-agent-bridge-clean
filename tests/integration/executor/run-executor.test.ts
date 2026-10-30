@@ -44,6 +44,24 @@ describe('RunExecutor', () => {
     expect(h.activeRuns.get('scope-1')).toBeUndefined();
   });
 
+  it('drains agent output before any event subscriber attaches', async () => {
+    const events = [
+      { type: 'text' as const, delta: 'x'.repeat(2 * 1024 * 1024) },
+      { type: 'done' as const, terminationReason: 'normal' as const },
+    ];
+    const h = await createHarness({ events });
+    const execution = await h.executor.submit({
+      scopeId: 'scope-early-drain',
+      policy: policy(h.tmp.workspace),
+    });
+
+    for (let attempt = 0; attempt < 10 && h.pool.snapshot().active > 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
+    expect(await collect(execution.subscribe())).toEqual(events);
+  });
   it('fans out one agent event stream to multiple consumers without spawning twice', async () => {
     const events = [
       { type: 'system' as const, sessionId: 'sess-1', cwd: '/repo' },

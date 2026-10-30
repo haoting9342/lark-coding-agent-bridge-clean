@@ -97,8 +97,13 @@ describe('markdown stream startup failures', () => {
         path: { message_id: 'om_first', reaction_id: 'reaction_1' },
       }),
     );
-    expect(lastMarkdown(h.channel)).toContain('agent 失败');
-    expect(lastMarkdown(h.channel)).toContain('codex exited with code 1');
+    await waitFor(() => h.channel.sent.length === 2);
+    const firstReply = h.channel.sent[0]!.content as { markdown: string };
+    expect(firstReply.markdown).toContain('agent 失败');
+    expect(firstReply.markdown).toContain('codex exited with code 1');
+    expect(h.channel.sent[0]!.options).toMatchObject({ replyTo: 'om_first' });
+    expect(h.channel.sent[1]!.options).toMatchObject({ replyTo: 'om_second' });
+    expect(lastMarkdown(h.channel)).toContain('没有返回可显示的最终内容');
   });
 
   it('does not wait for the working reaction before draining a failed agent run', async () => {
@@ -114,7 +119,12 @@ describe('markdown stream startup failures', () => {
     await h.channel.handlers.message?.(message('om_second', 'second'));
     await waitFor(() => h.agent.runOptions.length === 2, 1000);
 
-    expect(lastMarkdown(h.channel)).toContain('agent 失败');
+    await waitFor(() => h.channel.sent.length === 2);
+    const firstReply = h.channel.sent[0]!.content as { markdown: string };
+    expect(firstReply.markdown).toContain('agent 失败');
+    expect(h.channel.sent[0]!.options).toMatchObject({ replyTo: 'om_first' });
+    expect(h.channel.sent[1]!.options).toMatchObject({ replyTo: 'om_second' });
+    expect(lastMarkdown(h.channel)).toContain('没有返回可显示的最终内容');
 
     reaction.resolve({ data: { reaction_id: 'reaction_1' } });
     await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
@@ -260,6 +270,15 @@ describe('markdown stream startup failures', () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
 
     expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('reports a genuinely empty Codex round without claiming a card was recalled', async () => {
+    const h = await createHarness({ events: [{ type: 'done', terminationReason: 'normal' }] });
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_empty_final', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+    expect(lastMarkdown(h.channel)).toContain('没有返回可显示的最终内容');
+    expect(lastMarkdown(h.channel)).not.toContain('已回收');
   });
 
   it('waits for a slow-opening progress stream instead of replying alongside it', async () => {

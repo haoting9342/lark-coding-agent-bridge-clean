@@ -7,11 +7,12 @@ import type { AgentEvent } from '../../src/agent/types';
 const dirs:string[]=[];
 const id='01a06b52-faae-70e3-846c-cb51eb9d412a';
 afterEach(async()=>{await Promise.all(dirs.splice(0).map(d=>rm(d,{recursive:true,force:true})));});
-async function fixture(options:{repeat?:boolean;tool?:boolean;mcp?:boolean;otherError?:boolean;shared?:boolean}={}){
+async function fixture(options:{repeat?:boolean;tool?:boolean;mcp?:boolean;otherError?:boolean;shared?:boolean;startedId?:string}={}){
  const root=await mkdtemp(join(tmpdir(),'history-recovery-'));dirs.push(root);
+ const actualId=options.startedId ?? id;
  const home=join(root,options.shared?'shared':'provider-codex-home');await mkdir(join(home,'sessions'),{recursive:true});
- const file=join(home,'sessions',`rollout-${id}.jsonl`);const other=join(home,'sessions','unrelated.jsonl');await writeFile(other,'unreadable history must stay untouched');
- await writeFile(file,[{type:'session_meta',payload:{id}},{type:'response_item',payload:{id:'item_old',type:'reasoning',summary:[]}}].map(x=>JSON.stringify(x)).join('\n')+'\n');
+ const file=join(home,'sessions',`rollout-${actualId}.jsonl`);const other=join(home,'sessions','unrelated.jsonl');await writeFile(other,'unreadable history must stay untouched');
+ await writeFile(file,[{type:'session_meta',payload:{id:actualId}},{type:'response_item',payload:{id:'item_old',type:'reasoning',summary:[]}}].map(x=>JSON.stringify(x)).join('\n')+'\n');
  const binary=join(root,'fake.mjs');const records=join(root,'runs.jsonl');
  const failure=options.otherError?'rate limit':"Invalid 'input[39].id': 'item_old'. Expected an ID that begins with 'rs'.";
  await writeFile(binary,`#!/usr/bin/env node
@@ -19,7 +20,7 @@ import {readFileSync,appendFileSync} from 'node:fs';
 let prompt='';for await(const x of process.stdin)prompt+=x;
 appendFileSync(${JSON.stringify(records)},JSON.stringify({prompt,args:process.argv.slice(2)})+'\\n');
 const rows=readFileSync(${JSON.stringify(file)},'utf8').trim().split('\\n').map(x=>JSON.parse(x));
-console.log(JSON.stringify({type:'thread.started',thread_id:${JSON.stringify(id)}}));
+console.log(JSON.stringify({type:'thread.started',thread_id:${JSON.stringify(actualId)}}));
 if(rows[1].payload.id || ${!!options.repeat}){
  if(${!!options.mcp}) console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',id:'mcp'}}));
  if(${!!options.tool}) console.log(JSON.stringify({type:'item.started',item:{type:'command_execution',id:'tool',command:'test'}}));
@@ -37,6 +38,11 @@ it('repairs only the failed thread after process exit and transparently replays 
  expect(events.some(e=>e.type==='text'&&e.delta.includes('修复'))).toBe(true);expect(events.at(-1)).toMatchObject({type:'done',terminationReason:'normal'});
  const attempts=(await readFile(h.records,'utf8')).trim().split('\n').map(x=>JSON.parse(x));expect(attempts).toHaveLength(2);expect(attempts[0]).toEqual(attempts[1]);
  expect(await readFile(h.other,'utf8')).toBe('unreadable history must stay untouched');expect(await readFile(h.file,'utf8')).toContain('tail');
+});
+it('repairs the rollout identified by the actual thread.started id',async()=>{
+ const h=await fixture({startedId:'01a06b52-faae-70e3-846c-cb51eb9d4999'});const events=await collect(h.run.events);
+ expect(events.some(e=>e.type==='error')).toBe(false);expect(events.at(-1)).toMatchObject({type:'done',terminationReason:'normal'});
+ expect(await readFile(h.file,'utf8')).toContain('tail');expect((await readFile(h.records,'utf8')).trim().split('\n')).toHaveLength(2);
 });
 it('retries at most once and reports a concise failure if the retry still fails',async()=>{
  const h=await fixture({repeat:true});const events=await collect(h.run.events);expect(events.at(-1)).toMatchObject({type:'error'});expect((await readFile(h.records,'utf8')).trim().split('\n')).toHaveLength(2);

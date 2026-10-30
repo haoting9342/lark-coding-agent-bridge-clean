@@ -2,7 +2,7 @@ import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CodexAdapter } from '../../src/agent/codex/adapter.js';
+import { CodexAdapter, isHistoryIdCompatibilityError } from '../../src/agent/codex/adapter.js';
 import { buildCodexArgs } from '../../src/agent/codex/argv.js';
 import type { AgentEvent } from '../../src/agent/types.js';
 
@@ -10,6 +10,7 @@ interface FakeBinary {
   path: string;
   dir: string;
   recordPath: string;
+  attemptsPath: string;
 }
 
 describe('CodexAdapter process contract', () => {
@@ -33,6 +34,15 @@ describe('CodexAdapter process contract', () => {
         rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 }),
       ),
     );
+  });
+
+  it('recognizes provider history ID conflicts across upstream error formatting', () => {
+    expect(
+      isHistoryIdCompatibilityError(
+        `{"error":{"message":"Invalid input[109].id: item_d64ad7d64a2fbf58138ecb16. Expected an ID that begins with 'rs_'"}}`,
+      ),
+    ).toBe(true);
+    expect(isHistoryIdCompatibilityError('429 Too Many Requests')).toBe(false);
   });
 
   it('spawns a fresh JSON run with prompt on stdin and inherits the user Codex home by default', async () => {
@@ -318,6 +328,29 @@ describe('CodexAdapter process contract', () => {
     ]);
   });
 
+  it('releases the event stream when Codex exits before writing stdout', async () => {
+    const fake = await createFakeCodex({
+      lines: [],
+      stderr: 'catalog parse failed\n',
+      exitCode: 1,
+    });
+    cleanup.push(fake.dir);
+
+    const run = new CodexAdapter({ binary: fake.path, profileStateDir: fake.dir }).run({
+      runId: 'run-silent-fail',
+      prompt: 'fail before stdout',
+      cwd: await realpath(fake.dir),
+    });
+
+    await expect(collect(run.events)).resolves.toEqual([
+      {
+        type: 'error',
+        message: 'codex exited with code 1: catalog parse failed',
+        terminationReason: 'failed',
+      },
+    ]);
+  });
+
   it('continues after retryable raw error events and waits for the terminal turn event', async () => {
     const fake = await createFakeCodex({
       lines: [
@@ -343,6 +376,88 @@ describe('CodexAdapter process contract', () => {
       { type: 'final_text', content: 'after retry' },
       { type: 'done', threadId: 'thread-retry', terminationReason: 'normal' },
     ]);
+  });
+
+  it('retries a capacity failure before exposing it to the user', async () => {
+    const fake = await createFakeCodex({
+      lines: [],
+      attempts: [
+        {
+          lines: [
+            {
+              type: 'turn.failed',
+              error: { message: 'Selected model is at capacity. Please try a different model.' },
+            },
+          ],
+        },
+        {
+          lines: [
+            { type: 'thread.started', thread_id: 'thread-capacity-recovered' },
+            { type: 'agent_message', message: 'recovered after capacity retry' },
+            { type: 'turn.completed' },
+          ],
+        },
+      ],
+    });
+    cleanup.push(fake.dir);
+
+    const run = new CodexAdapter({ binary: fake.path, profileStateDir: fake.dir }).run({
+      runId: 'run-capacity-retry',
+      prompt: 'retry capacity',
+      cwd: await realpath(fake.dir),
+    });
+
+    expect(await collect(run.events)).toEqual([
+      { type: 'system', threadId: 'thread-capacity-recovered' },
+      { type: 'final_text', content: 'recovered after capacity retry' },
+      { type: 'done', threadId: 'thread-capacity-recovered', terminationReason: 'normal' },
+    ]);
+    expect(await readFile(fake.attemptsPath, 'utf8')).toBe('2');
+  });
+
+  it('does not retry capacity after tool activity has started', async () => {
+    const fake = await createFakeCodex({
+      lines: [],
+      attempts: [
+        {
+          lines: [
+            { type: 'thread.started', thread_id: 'thread-capacity-tool' },
+            {
+              type: 'item.started',
+              item: { type: 'command_execution', id: 'cmd-1', command: 'printf ready' },
+            },
+            {
+              type: 'turn.failed',
+              error: { message: 'Selected model is at capacity. Please try a different model.' },
+            },
+          ],
+        },
+        {
+          lines: [
+            { type: 'thread.started', thread_id: 'should-not-run' },
+            { type: 'turn.completed' },
+          ],
+        },
+      ],
+    });
+    cleanup.push(fake.dir);
+
+    const run = new CodexAdapter({ binary: fake.path, profileStateDir: fake.dir }).run({
+      runId: 'run-capacity-after-tool',
+      prompt: 'do not replay tool',
+      cwd: await realpath(fake.dir),
+    });
+
+    expect(await collect(run.events)).toEqual([
+      { type: 'system', threadId: 'thread-capacity-tool' },
+      { type: 'tool_use', id: 'cmd-1', name: 'command_execution', input: { command: 'printf ready' } },
+      {
+        type: 'error',
+        message: 'Selected model is at capacity. Please try a different model.',
+        terminationReason: 'failed',
+      },
+    ]);
+    expect(await readFile(fake.attemptsPath, 'utf8')).toBe('1');
   });
 
   it('surfaces spawn errors as stream error events', async () => {
@@ -429,19 +544,29 @@ async function createFakeCodex(options: {
   stderr?: string;
   exitCode?: number;
   exitDelayMs?: number;
+  attempts?: Array<{ lines: unknown[]; stderr?: string; exitCode?: number; exitDelayMs?: number }>;
 }): Promise<FakeBinary> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-adapter-test-'));
   const path = join(dir, 'fake-codex.mjs');
   const recordPath = join(dir, 'argv.json');
+  const attemptsPath = join(dir, 'attempts.txt');
+  const attempts = options.attempts ?? [{
+    lines: options.lines,
+    stderr: options.stderr,
+    exitCode: options.exitCode,
+    exitDelayMs: options.exitDelayMs,
+  }];
   await writeFile(
     path,
     [
       '#!/usr/bin/env node',
-      'import { writeFileSync } from "node:fs";',
+      'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
       'let stdin = "";',
       'process.stdin.setEncoding("utf8");',
       'process.stdin.on("data", (chunk) => { stdin += chunk; });',
       'process.stdin.on("end", () => {',
+      `  const attempt = existsSync(${JSON.stringify(attemptsPath)}) ? Number(readFileSync(${JSON.stringify(attemptsPath)}, "utf8")) : 0;`,
+      `  writeFileSync(${JSON.stringify(attemptsPath)}, String(attempt + 1));`,
       `  writeFileSync(${JSON.stringify(recordPath)}, JSON.stringify({`,
       '    argv: process.argv.slice(2),',
       '    cwd: process.cwd(),',
@@ -457,16 +582,17 @@ async function createFakeCodex(options: {
       '      PATH: process.env.PATH,',
       '    },',
       '  }));',
-      `  const lines = ${JSON.stringify(options.lines)};`,
+      `  const spec = ${JSON.stringify(attempts)}[Math.min(attempt, ${attempts.length - 1})];`,
+      '  const lines = spec.lines;',
       '  for (const line of lines) console.log(JSON.stringify(line));',
-      options.stderr ? `  process.stderr.write(${JSON.stringify(options.stderr)});` : '',
-      `  setTimeout(() => process.exit(${options.exitCode ?? 0}), ${options.exitDelayMs ?? 0});`,
+      '  if (spec.stderr) process.stderr.write(spec.stderr);',
+      '  setTimeout(() => process.exit(spec.exitCode ?? 0), spec.exitDelayMs ?? 0);',
       '});',
     ].filter(Boolean).join('\n'),
     'utf8',
   );
   await chmod(path, 0o755);
-  return { path, dir, recordPath };
+  return { path, dir, recordPath, attemptsPath };
 }
 
 async function readRecord(path: string): Promise<{

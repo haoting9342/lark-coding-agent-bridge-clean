@@ -1263,6 +1263,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           chatId,
           scope,
           state: finalReplyState(progress, filterForPrefs(latestState)),
+          allowEmptyFallback: !hasVisibleProgressText(progress, filterForPrefs(latestState)),
           replyMode,
           sendOpts,
           cardRenderOptions,
@@ -1326,6 +1327,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           chatId,
           scope,
           state: finalReplyState(progress, filterForPrefs(latestState)),
+          allowEmptyFallback: !hasVisibleProgressText(progress, filterForPrefs(latestState)),
           replyMode,
           sendOpts,
           cardRenderOptions,
@@ -1466,6 +1468,10 @@ function finalReplyState(progress: LazyProgressStream, state: RunState): RunStat
   };
 }
 
+function hasVisibleProgressText(progress: LazyProgressStream, state: RunState): boolean {
+  return progress.opened() && !progress.abandoned() && renderText(state).trim().length > 0;
+}
+
 /**
  * Backstop for a progress stream that was opened on real content and still
  * ended up empty — e.g. `/config` hiding tool calls mid-run, which retroactively
@@ -1520,6 +1526,7 @@ async function sendFinalReply(input: {
   chatId: string;
   scope: string;
   state: RunState;
+  allowEmptyFallback?: boolean;
   replyMode: ReturnType<typeof getMessageReplyMode>;
   sendOpts: { replyTo: string; replyInThread?: boolean };
   cardRenderOptions: { signCallback?: (action: string) => string };
@@ -1531,7 +1538,11 @@ async function sendFinalReply(input: {
   // empty turn. The process card is recalled in that case; send a visible
   // fallback so the user is never left with no reply.
   if (!body.trim()) {
-    const notice = '⚠️ 本次运行没有返回可显示的最终内容，过程卡已回收。请重试。';
+    if (input.allowEmptyFallback === false) {
+      log.info('outbound', 'skip-empty', { scope: input.scope, mode: input.replyMode });
+      return;
+    }
+    const notice = '⚠️ 本次运行没有返回可显示的最终内容。请重试。';
     const result = await input.channel.send(
       input.chatId,
       { markdown: notice },

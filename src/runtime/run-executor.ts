@@ -251,6 +251,7 @@ class EventFanout {
   constructor(source: AsyncIterable<AgentEvent>, onDone: () => Promise<void>) {
     this.source = source;
     this.onDone = onDone;
+    this.start();
   }
 
   subscribe(): AsyncIterable<AgentEvent> {

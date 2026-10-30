@@ -1,10 +1,11 @@
+import { accessSync, constants as fsConstants } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { repairCodexHistory } from '../../runtime/codex-history-repair';
 import { homedir } from 'node:os';
 import { recoverProviderSwitch } from '../../runtime/codex-provider';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
-import { join, resolve } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import type { SandboxMode } from '../../config/profile-schema';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
@@ -35,6 +36,42 @@ export interface CodexAdapterOptions {
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
+
+const LINUX_STDOUT_SETUP = [
+  'import fcntl, os, socket, sys',
+  'try:',
+  '    stdout_socket = socket.socket(fileno=1)',
+  '    try:',
+  '        stdout_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)',
+  '    except OSError:',
+  '        pass',
+  '    stdout_socket.detach()',
+  'except OSError:',
+  '    pass',
+  'try:',
+  '    flags = fcntl.fcntl(1, fcntl.F_GETFL)',
+  '    fcntl.fcntl(1, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)',
+  'except OSError:',
+  '    pass',
+  'os.execvp(sys.argv[1], sys.argv[1:])',
+].join('\n');
+
+const MAX_CAPACITY_RETRIES = 3;
+const CAPACITY_RETRY_BASE_DELAY_MS = 250;
+
+function findExecutableInPath(name: string, pathValue: string | undefined): string | undefined {
+  if (!pathValue) return undefined;
+  for (const directory of pathValue.split(delimiter)) {
+    const candidate = join(directory || process.cwd(), name);
+    try {
+      accessSync(candidate, fsConstants.X_OK);
+      return candidate;
+    } catch {
+      // Continue searching PATH entries.
+    }
+  }
+  return undefined;
+}
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
@@ -107,7 +144,9 @@ export class CodexAdapter implements AgentAdapter {
   run(opts: AgentRunOptions): AgentRun {
     if (opts.threadId && this.repairingThreads.has(opts.threadId)) throw new Error('当前会话正在修复，请稍后重试。');
     let outputStarted = false;
+    let currentThreadId = opts.threadId;
     let current = this.runOnce(opts, () => { outputStarted = true; });
+    let capacityRetries = 0;
     let stopped = false;
     const adapter = this;
     return {
@@ -115,42 +154,79 @@ export class CodexAdapter implements AgentAdapter {
       async stop() { stopped = true; await current.stop(); },
       waitForExit(timeoutMs) { return current.waitForExit(timeoutMs); },
       events: (async function* (): AsyncGenerator<AgentEvent> {
-        for await (const event of current.events) {
-          if (event.type === 'tool_use' || event.type === 'tool_result' || event.type === 'text' || event.type === 'final_text') outputStarted = true;
-          const home = adapter.effectiveHome();
-          const eligible = event.type === 'error' && event.terminationReason === 'failed' && !outputStarted && !stopped
-            && opts.threadId && isHistoryIdCompatibilityError(event.message)
-            && resolve(home) === resolve(join(adapter.profileStateDir, 'provider-codex-home'));
-          if (!eligible) { yield event; continue; }
-          // Finish the failed writer before touching its rollout; keep the logical run active.
-          if (!await current.waitForExit(5000)) { await current.stop(); }
-          if (!await current.waitForExit(1000)) { yield event; return; }
-          if (stopped) { yield { type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' }; return; }
-          const threadId = opts.threadId!;
-          if ([...adapter.childThreads.values()].includes(threadId) || adapter.repairingThreads.has(threadId)) {
-            yield { type: 'error', message: '当前会话仍有其他任务运行，暂时无法自动修复。请稍后重试。', terminationReason: 'failed' }; return;
-          }
-          adapter.repairingThreads.add(threadId);
-          try {
-            if ((await lstat(home)).isSymbolicLink()) throw new Error('Linked home');
-            yield { type: 'text', delta: '正在修复当前会话，完成后继续原指令。\n\n' };
-            if (!stopped) {
-              const result = await repairCodexHistory(home, threadId);
-              if (!result.removedIds) throw new Error('No compatible repair found');
-              log.info('agent', 'history-repaired', { threadId, files: result.files, removedIds: result.removedIds, backupDir: result.backupDir });
+        for (;;) {
+          let retryCapacity = false;
+          for await (const event of current.events) {
+            if (event.type === 'system' && event.threadId) currentThreadId = event.threadId;
+            if (event.type === 'tool_use' || event.type === 'tool_result' || event.type === 'text' || event.type === 'final_text') outputStarted = true;
+
+            if (
+              event.type === 'error' &&
+              event.terminationReason === 'failed' &&
+              !outputStarted &&
+              !stopped &&
+              capacityRetries < MAX_CAPACITY_RETRIES &&
+              isCapacityError(event.message)
+            ) {
+              // Capacity errors occur before a usable response. Drain the
+              // failed child before retrying the same request, so no two
+              // writers can overlap and no partial tool activity is replayed.
+              if (!await current.waitForExit(5000)) { await current.stop(); }
+              if (!await current.waitForExit(1000)) { yield event; return; }
+              capacityRetries++;
+              const delayMs = CAPACITY_RETRY_BASE_DELAY_MS * (2 ** (capacityRetries - 1));
+              log.warn('agent', 'capacity-retry', {
+                attempt: capacityRetries,
+                maxAttempts: MAX_CAPACITY_RETRIES,
+                delayMs,
+                runId: opts.runId,
+              });
+              await delay(delayMs);
+              if (stopped) {
+                yield { type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' };
+                return;
+              }
+              current = adapter.runOnce(opts, () => { outputStarted = true; });
+              retryCapacity = true;
+              break;
             }
-          } catch {
-            yield { type: 'error', message: '当前会话未能安全修复，原指令尚未继续。请检查该会话的历史备份。', terminationReason: 'failed' }; return;
-          } finally { adapter.repairingThreads.delete(threadId); }
-          if (stopped) { yield { type: 'done', threadId, terminationReason: 'interrupted' }; return; }
-          current = adapter.runOnce(opts);
-          // A single retry bounds recovery and prevents loops on a different upstream problem.
-          for await (const retried of current.events) {
-            if (retried.type === 'error' && isHistoryIdCompatibilityError(retried.message)) {
-              yield { type: 'error', message: '会话修复后仍未能继续，已停止自动重试；原指令尚未完成。', terminationReason: 'failed' };
-            } else yield retried;
+
+            const home = adapter.effectiveHome();
+            const eligible = event.type === 'error' && event.terminationReason === 'failed' && !outputStarted && !stopped
+              && currentThreadId && isHistoryIdCompatibilityError(event.message)
+              && resolve(home) === resolve(join(adapter.profileStateDir, 'provider-codex-home'));
+            if (!eligible) { yield event; continue; }
+            // Finish the failed writer before touching its rollout; keep the logical run active.
+            if (!await current.waitForExit(5000)) { await current.stop(); }
+            if (!await current.waitForExit(1000)) { yield event; return; }
+            if (stopped) { yield { type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' }; return; }
+            const threadId = currentThreadId!;
+            if ([...adapter.childThreads.values()].includes(threadId) || adapter.repairingThreads.has(threadId)) {
+              yield { type: 'error', message: '当前会话仍有其他任务运行，暂时无法自动修复。请稍后重试。', terminationReason: 'failed' }; return;
+            }
+            adapter.repairingThreads.add(threadId);
+            try {
+              if ((await lstat(home)).isSymbolicLink()) throw new Error('Linked home');
+              yield { type: 'text', delta: '正在修复当前会话，完成后继续原指令。\n\n' };
+              if (!stopped) {
+                const result = await repairCodexHistory(home, threadId);
+                if (!result.removedIds) throw new Error('No compatible repair found');
+                log.info('agent', 'history-repaired', { threadId, files: result.files, removedIds: result.removedIds, backupDir: result.backupDir });
+              }
+            } catch {
+              yield { type: 'error', message: '当前会话未能安全修复，原指令尚未继续。请检查该会话的历史备份。', terminationReason: 'failed' }; return;
+            } finally { adapter.repairingThreads.delete(threadId); }
+            if (stopped) { yield { type: 'done', threadId, terminationReason: 'interrupted' }; return; }
+            current = adapter.runOnce(opts, () => { outputStarted = true; });
+            // A single retry bounds recovery and prevents loops on a different upstream problem.
+            for await (const retried of current.events) {
+              if (retried.type === 'error' && isHistoryIdCompatibilityError(retried.message)) {
+                yield { type: 'error', message: '会话修复后仍未能继续，已停止自动重试；原指令尚未完成。', terminationReason: 'failed' };
+              } else yield retried;
+            }
+            return;
           }
-          return;
+          if (!retryCapacity) return;
         }
       })(),
     };
@@ -176,9 +252,14 @@ export class CodexAdapter implements AgentAdapter {
     } else if (!this.inheritCodexHome) {
       envOverrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
     }
-    const child = spawnProcess(this.binary, args, {
+    const env = mergeProcessEnv(process.env, envOverrides);
+    const python3 = process.platform === 'linux' ? findExecutableInPath('python3', env.PATH) : undefined;
+    const command = python3
+      ? { binary: python3, args: ['-c', LINUX_STDOUT_SETUP, this.binary, ...args] }
+      : { binary: this.binary, args };
+    const child = spawnProcess(command.binary, command.args, {
       cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, envOverrides),
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as CodexChild;
 
@@ -299,12 +380,15 @@ async function* createEventStream(
   const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let sawStdout = false;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
-  const closeSilentStdout = (): void => {
+  const closeExitedStdout = (): void => {
+    // Some Codex startup failures only write stderr and leave stdout open.
+    // Close the pipe after the process exits so readline terminates and the
+    // fanout cleanup releases the scope and process-pool slot.
     silentExitTimer = setTimeout(() => {
-      if (!sawStdout && !child.stdout.readableEnded) child.stdout.destroy();
-    }, 50);
+      if (!child.stdout.readableEnded) child.stdout.destroy();
+    }, sawStdout ? 250 : 50);
   };
-  child.once('exit', closeSilentStdout);
+  child.once('exit', closeExitedStdout);
   try {
     for await (const line of rl) {
       sawStdout = true;
@@ -324,7 +408,7 @@ async function* createEventStream(
     }
   } finally {
     if (silentExitTimer) clearTimeout(silentExitTimer);
-    child.removeListener('exit', closeSilentStdout);
+    child.removeListener('exit', closeExitedStdout);
     rl.close();
   }
 
@@ -375,5 +459,13 @@ function isWindowsCommandNotFoundLine(line: string): boolean {
 }
 
 export function isHistoryIdCompatibilityError(message: string): boolean {
-  return /Invalid\s+['"]input\[\d+\]\.id['"][\s\S]*?['"]item_[a-z0-9]+['"][\s\S]*?Expected an ID that begins with ['"][a-z]+_?['"]/i.test(message);
+  return /invalid[\s\S]*?(?:input\[\d+\]\.id|\bid\b)[\s\S]*?item_[a-z0-9_-]+[\s\S]*?expected\s+an?\s+id\s+that\s+begins\s+with\s+['"][a-z][a-z0-9_-]*['"]/i.test(message);
+}
+
+export function isCapacityError(message: string): boolean {
+  return /selected\s+model\s+is\s+at\s+capacity|model\s+is\s+at\s+capacity|currently\s+overloaded|temporarily\s+overloaded|over\s+capacity|upstream\s+overload/i.test(message);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

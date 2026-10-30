@@ -89,6 +89,10 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     };
   }
 
+  const model = resolveModelArg(
+    input.profileConfig.agentKind,
+    input.profileConfig.preferences.model,
+  );
   const policy = evaluateRunPolicy({
     scope: input.scope,
     attachments: input.attachments,
@@ -144,10 +148,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       policy,
       sessionId,
       threadId,
-      model: resolveModelArg(
-        input.profileConfig.agentKind,
-        input.profileConfig.preferences.model,
-      ),
+      model,
       images:
         input.capability.agentId === 'codex'
           ? policy.attachments

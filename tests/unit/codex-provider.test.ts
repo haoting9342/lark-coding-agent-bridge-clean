@@ -43,6 +43,7 @@ it('recovers interrupted pair writes before a new switch',async()=>{
 it('switches without reading or modifying histories, including same-source selection',async()=>{
  const home=await fixture();await mkdir(join(home,'sessions'));const file=join(home,'sessions','old.jsonl');
  const old='malformed or unused history must not be scanned';await writeFile(file,old);
- await switchProvider(home,'api');await switchProvider(home,'chatgpt');
+ expect(await switchProvider(home,'api')).toMatchObject({mode:'api'});
+ expect(await switchProvider(home,'chatgpt')).toMatchObject({mode:'chatgpt'});
  expect(await readFile(file,'utf8')).toBe(old);expect((await getProviderStatus(home)).mode).toBe('chatgpt');
 });

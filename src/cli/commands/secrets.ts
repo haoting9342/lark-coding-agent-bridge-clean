@@ -68,7 +68,7 @@ export async function runSecretsGet(): Promise<void> {
   };
   for (const id of ids) {
     try {
-      const v = await resolveSecretAcrossProfiles(id);
+      const v = await resolveSecretAcrossProfiles(id, paths.rootDir, undefined, process.env.LARK_CHANNEL_PROFILE);
       if (v !== undefined) {
         resp.values[id] = v;
       } else {
@@ -132,7 +132,7 @@ export async function resolveSecretAcrossProfiles(
   id: string,
   rootDir: string = paths.rootDir,
   warn: (message: string) => void = (message) => console.error(message),
-  profile: string | undefined = process.env.LARK_CHANNEL_PROFILE,
+  profile?: string,
 ): Promise<string | undefined> {
   if (profile) {
     const appPaths = resolveAppPaths({ rootDir, profile });
