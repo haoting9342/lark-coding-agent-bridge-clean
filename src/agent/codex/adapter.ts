@@ -1,6 +1,6 @@
 import { accessSync, constants as fsConstants } from 'node:fs';
 import { lstat } from 'node:fs/promises';
-import { repairCodexHistory } from '../../runtime/codex-history-repair';
+import { repairCodexHistory, type HistoryRepairKind } from '../../runtime/codex-history-repair';
 import { homedir } from 'node:os';
 import { recoverProviderSwitch } from '../../runtime/codex-provider';
 import { createInterface } from 'node:readline';
@@ -58,6 +58,8 @@ const LINUX_STDOUT_SETUP = [
 
 const MAX_CAPACITY_RETRIES = 3;
 const CAPACITY_RETRY_BASE_DELAY_MS = 250;
+const MAX_DECRYPTION_RETRIES = 2;
+const DECRYPTION_RETRY_BASE_DELAY_MS = 1000;
 
 function findExecutableInPath(name: string, pathValue: string | undefined): string | undefined {
   if (!pathValue) return undefined;
@@ -147,15 +149,28 @@ export class CodexAdapter implements AgentAdapter {
     let currentThreadId = opts.threadId;
     let current = this.runOnce(opts, () => { outputStarted = true; });
     let capacityRetries = 0;
+    let decryptionRetries = 0;
+    const attemptedRepairs = new Set<HistoryRepairKind>();
     let stopped = false;
     const adapter = this;
+    const finishFailedAttempt = async (): Promise<boolean> => {
+      const failed = current;
+      if (!await failed.waitForExit(5000)) await failed.stop();
+      if (!await failed.waitForExit(1000)) return false;
+      // A terminal event can precede the last buffered stdout items. Consume
+      // them so onActivity observes even tool types hidden by the translator.
+      for await (const pending of failed.events) {
+        if (pending.type === 'tool_use' || pending.type === 'tool_result' || pending.type === 'text' || pending.type === 'final_text') outputStarted = true;
+      }
+      return !outputStarted;
+    };
     return {
       runId: opts.runId,
       async stop() { stopped = true; await current.stop(); },
       waitForExit(timeoutMs) { return current.waitForExit(timeoutMs); },
       events: (async function* (): AsyncGenerator<AgentEvent> {
         for (;;) {
-          let retryCapacity = false;
+          let retryRequested = false;
           for await (const event of current.events) {
             if (event.type === 'system' && event.threadId) currentThreadId = event.threadId;
             if (event.type === 'tool_use' || event.type === 'tool_result' || event.type === 'text' || event.type === 'final_text') outputStarted = true;
@@ -171,8 +186,7 @@ export class CodexAdapter implements AgentAdapter {
               // Capacity errors occur before a usable response. Drain the
               // failed child before retrying the same request, so no two
               // writers can overlap and no partial tool activity is replayed.
-              if (!await current.waitForExit(5000)) { await current.stop(); }
-              if (!await current.waitForExit(1000)) { yield event; return; }
+              if (!await finishFailedAttempt()) { yield event; return; }
               capacityRetries++;
               const delayMs = CAPACITY_RETRY_BASE_DELAY_MS * (2 ** (capacityRetries - 1));
               log.warn('agent', 'capacity-retry', {
@@ -183,52 +197,72 @@ export class CodexAdapter implements AgentAdapter {
               });
               await delay(delayMs);
               if (stopped) {
-                yield { type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' };
+                yield { type: 'done', threadId: currentThreadId, terminationReason: 'interrupted' };
                 return;
               }
-              current = adapter.runOnce(opts, () => { outputStarted = true; });
-              retryCapacity = true;
+              current = adapter.runOnce({ ...opts, threadId: currentThreadId }, () => { outputStarted = true; });
+              retryRequested = true;
               break;
             }
 
+            if (event.type !== 'error' || event.terminationReason !== 'failed' || outputStarted || stopped || !currentThreadId) {
+              yield event; continue;
+            }
             const home = adapter.effectiveHome();
-            const repairKind = event.type === 'error' && isEncryptedFunctionOutputError(event.message)
-              ? 'encoded-agent-message' : 'history-id';
-            const eligible = event.type === 'error' && event.terminationReason === 'failed' && !outputStarted && !stopped
-              && currentThreadId && (isHistoryIdCompatibilityError(event.message) || isEncryptedFunctionOutputError(event.message))
+            const functionOutputError = isEncryptedFunctionOutputError(event.message);
+            const decryptionError = functionOutputError || isCompactionDecryptionError(event.message);
+            const repairKind: HistoryRepairKind = functionOutputError ? 'encoded-agent-message' : 'history-id';
+            const canRepair = (functionOutputError || isHistoryIdCompatibilityError(event.message))
+              && !attemptedRepairs.has(repairKind)
               && resolve(home) === resolve(join(adapter.profileStateDir, 'provider-codex-home'));
-            if (!eligible) { yield event; continue; }
+            const canRetry = decryptionError && decryptionRetries < MAX_DECRYPTION_RETRIES;
+            if (!canRepair && !canRetry) { yield event; continue; }
             // Finish the failed writer before touching its rollout; keep the logical run active.
-            if (!await current.waitForExit(5000)) { await current.stop(); }
-            if (!await current.waitForExit(1000)) { yield event; return; }
-            if (stopped) { yield { type: 'done', threadId: opts.threadId, terminationReason: 'interrupted' }; return; }
-            const threadId = currentThreadId!;
+            if (!await finishFailedAttempt()) { yield event; return; }
+            if (stopped) { yield { type: 'done', threadId: currentThreadId, terminationReason: 'interrupted' }; return; }
+            const threadId = currentThreadId;
             if ([...adapter.childThreads.values()].includes(threadId) || adapter.repairingThreads.has(threadId)) {
               yield { type: 'error', message: '当前会话仍有其他任务运行，暂时无法自动修复。请稍后重试。', terminationReason: 'failed' }; return;
             }
             adapter.repairingThreads.add(threadId);
             try {
-              if ((await lstat(home)).isSymbolicLink()) throw new Error('Linked home');
-              yield { type: 'text', delta: '正在修复当前会话，完成后继续原指令。\n\n' };
-              if (!stopped) {
-                const result = await repairCodexHistory(home, threadId, { kind: repairKind });
-                if (!result.removedIds && !result.restoredMessages) throw new Error('No compatible repair found');
-                log.info('agent', 'history-repaired', { threadId, kind: repairKind, files: result.files, removedIds: result.removedIds, restoredMessages: result.restoredMessages, backupDir: result.backupDir });
+              if (canRepair) {
+                attemptedRepairs.add(repairKind);
+                try {
+                  if ((await lstat(home)).isSymbolicLink()) throw new Error('Linked home');
+                  yield { type: 'text', delta: '正在检查并尝试修复当前会话，完成后继续原指令。\n\n' };
+                  if (!stopped) {
+                    const result = await repairCodexHistory(home, threadId, { kind: repairKind });
+                    if (result.removedIds || result.restoredMessages) {
+                      log.info('agent', 'history-repaired', { threadId, kind: repairKind, files: result.files, removedIds: result.removedIds, restoredMessages: result.restoredMessages, backupDir: result.backupDir });
+                      retryRequested = true;
+                    } else if (!decryptionError) throw new Error('No compatible repair found');
+                    // Opaque ciphertext stays untouched; a transient upstream
+                    // decryption failure may still recover through a bounded retry.
+                  }
+                } catch (err) {
+                  log.warn('agent', 'history-repair-failed', { threadId, kind: repairKind, message: String(err) });
+                  yield { type: 'error', message: '当前会话未能安全修复，原指令尚未继续。请检查该会话的历史备份。', terminationReason: 'failed' }; return;
+                }
               }
-            } catch {
-              yield { type: 'error', message: '当前会话未能安全修复，原指令尚未继续。请检查该会话的历史备份。', terminationReason: 'failed' }; return;
+              if (stopped) { yield { type: 'done', threadId, terminationReason: 'interrupted' }; return; }
+              if (!retryRequested) {
+                if (!canRetry) { yield event; return; }
+                decryptionRetries++;
+                const delayMs = DECRYPTION_RETRY_BASE_DELAY_MS * (2 ** (decryptionRetries - 1));
+                log.warn('agent', 'decryption-retry', { threadId, attempt: decryptionRetries, maxAttempts: MAX_DECRYPTION_RETRIES, delayMs, runId: opts.runId });
+                yield { type: 'text', delta: `上游未能读取会话加密内容，正在原会话中重试（${decryptionRetries}/${MAX_DECRYPTION_RETRIES}）。\n\n` };
+                if (!stopped) await delay(delayMs);
+                if (stopped) { yield { type: 'done', threadId, terminationReason: 'interrupted' }; return; }
+                retryRequested = true;
+              }
+              // All attempts pass through the same activity guard and budgets.
+              // Use the observed thread ID even if the initial resume changed it.
+              current = adapter.runOnce({ ...opts, threadId }, () => { outputStarted = true; });
             } finally { adapter.repairingThreads.delete(threadId); }
-            if (stopped) { yield { type: 'done', threadId, terminationReason: 'interrupted' }; return; }
-            current = adapter.runOnce(opts, () => { outputStarted = true; });
-            // A single retry bounds recovery and prevents loops on a different upstream problem.
-            for await (const retried of current.events) {
-              if (retried.type === 'error' && (isHistoryIdCompatibilityError(retried.message) || isEncryptedFunctionOutputError(retried.message))) {
-                yield { type: 'error', message: '会话修复后仍未能继续，已停止自动重试；原指令尚未完成。', terminationReason: 'failed' };
-              } else yield retried;
-            }
-            return;
+            break;
           }
-          if (!retryCapacity) return;
+          if (!retryRequested) return;
         }
       })(),
     };
@@ -466,6 +500,10 @@ export function isHistoryIdCompatibilityError(message: string): boolean {
 
 export function isEncryptedFunctionOutputError(message: string): boolean {
   return /encrypted function output content could not be decrypted or decoded/i.test(message);
+}
+
+export function isCompactionDecryptionError(message: string): boolean {
+  return /encrypted content for item cmp_[a-z0-9_-]+ could not be verified\.[\s\S]*encrypted content could not be decrypted or parsed/i.test(message);
 }
 
 export function isCapacityError(message: string): boolean {

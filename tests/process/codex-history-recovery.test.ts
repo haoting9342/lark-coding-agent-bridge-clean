@@ -62,7 +62,7 @@ it('repairs misencoded collaboration content and resumes the same thread with th
  const attempts=(await readFile(h.records,'utf8')).trim().split('\n').map(x=>JSON.parse(x));expect(attempts).toHaveLength(2);expect(attempts[0]).toEqual(attempts[1]);
  expect(await readFile(h.file,'utf8')).toContain('子任务已完成');expect(await readFile(h.other,'utf8')).toBe('unreadable history must stay untouched');
 });
-for(const options of [{encoded:true,tool:true},{encoded:true,mcp:true},{encoded:true,opaque:true}])it(`does not erase opaque content or replay side effects ${JSON.stringify(options)}`,async()=>{
+for(const options of [{encoded:true,tool:true},{encoded:true,mcp:true}])it(`does not erase opaque content or replay side effects ${JSON.stringify(options)}`,async()=>{
  const h=await fixture(options);const events=await collect(h.run.events);expect(events.at(-1)).toMatchObject({type:'error'});await h.run.waitForExit(1000);
  expect((await readFile(h.records,'utf8')).trim().split('\n')).toHaveLength(1);expect(await readFile(h.file,'utf8')).toContain('encrypted_content');
 });
