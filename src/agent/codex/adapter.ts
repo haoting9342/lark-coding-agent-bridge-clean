@@ -192,8 +192,10 @@ export class CodexAdapter implements AgentAdapter {
             }
 
             const home = adapter.effectiveHome();
+            const repairKind = event.type === 'error' && isEncryptedFunctionOutputError(event.message)
+              ? 'encoded-agent-message' : 'history-id';
             const eligible = event.type === 'error' && event.terminationReason === 'failed' && !outputStarted && !stopped
-              && currentThreadId && isHistoryIdCompatibilityError(event.message)
+              && currentThreadId && (isHistoryIdCompatibilityError(event.message) || isEncryptedFunctionOutputError(event.message))
               && resolve(home) === resolve(join(adapter.profileStateDir, 'provider-codex-home'));
             if (!eligible) { yield event; continue; }
             // Finish the failed writer before touching its rollout; keep the logical run active.
@@ -209,9 +211,9 @@ export class CodexAdapter implements AgentAdapter {
               if ((await lstat(home)).isSymbolicLink()) throw new Error('Linked home');
               yield { type: 'text', delta: '正在修复当前会话，完成后继续原指令。\n\n' };
               if (!stopped) {
-                const result = await repairCodexHistory(home, threadId);
-                if (!result.removedIds) throw new Error('No compatible repair found');
-                log.info('agent', 'history-repaired', { threadId, files: result.files, removedIds: result.removedIds, backupDir: result.backupDir });
+                const result = await repairCodexHistory(home, threadId, { kind: repairKind });
+                if (!result.removedIds && !result.restoredMessages) throw new Error('No compatible repair found');
+                log.info('agent', 'history-repaired', { threadId, kind: repairKind, files: result.files, removedIds: result.removedIds, restoredMessages: result.restoredMessages, backupDir: result.backupDir });
               }
             } catch {
               yield { type: 'error', message: '当前会话未能安全修复，原指令尚未继续。请检查该会话的历史备份。', terminationReason: 'failed' }; return;
@@ -220,7 +222,7 @@ export class CodexAdapter implements AgentAdapter {
             current = adapter.runOnce(opts, () => { outputStarted = true; });
             // A single retry bounds recovery and prevents loops on a different upstream problem.
             for await (const retried of current.events) {
-              if (retried.type === 'error' && isHistoryIdCompatibilityError(retried.message)) {
+              if (retried.type === 'error' && (isHistoryIdCompatibilityError(retried.message) || isEncryptedFunctionOutputError(retried.message))) {
                 yield { type: 'error', message: '会话修复后仍未能继续，已停止自动重试；原指令尚未完成。', terminationReason: 'failed' };
               } else yield retried;
             }
@@ -460,6 +462,10 @@ function isWindowsCommandNotFoundLine(line: string): boolean {
 
 export function isHistoryIdCompatibilityError(message: string): boolean {
   return /invalid[\s\S]*?(?:input\[\d+\]\.id|\bid\b)[\s\S]*?item_[a-z0-9_-]+[\s\S]*?expected\s+an?\s+id\s+that\s+begins\s+with\s+['"][a-z][a-z0-9_-]*['"]/i.test(message);
+}
+
+export function isEncryptedFunctionOutputError(message: string): boolean {
+  return /encrypted function output content could not be decrypted or decoded/i.test(message);
 }
 
 export function isCapacityError(message: string): boolean {

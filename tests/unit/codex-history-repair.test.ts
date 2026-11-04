@@ -28,3 +28,30 @@ it('rejects malformed JSON before replacing that rollout',async()=>{
  const h=await fixture();const file=join(h,'sessions',name);const source=JSON.stringify({type:'session_meta',payload:{id}})+'\n'+JSON.stringify({type:'response_item',payload:{id:'item_unsafe',type:'reasoning'}})+'\n{broken';await writeFile(file,source);
  await expect(repairCodexHistory(h,id)).rejects.toThrow();expect(await readFile(file,'utf8')).toBe(source);
 });
+
+it('restores base64 agent messages without touching real ciphertext, IDs, compaction or byte offsets', async () => {
+ const h=await fixture();const file=join(h,'sessions',name);
+ const message='子任务完成。\n保留 "结果" 和原 thread。';
+ const encoded='c2a-msg-v1:'+Buffer.from(message).toString('base64');
+ const agentMessage={type:'agent_message',id:'amsg_keep',author:'/root/worker',recipient:'/root',content:[{type:'input_text',text:'Payload:\n'},{type:'encrypted_content',encrypted_content:encoded}],internal_chat_message_metadata_passthrough:{content_item_metadata:[{provenance:{type:'tool'}},{provenance:{type:'tool'}}]}};
+ const rows=[{type:'session_meta',payload:{id}},{type:'response_item',payload:agentMessage},{type:'response_item',payload:{type:'reasoning',id:'item_keep',encrypted_content:'real-ciphertext'}},{type:'response_item',payload:{...agentMessage,content:[{type:'encrypted_content',encrypted_content:'opaque-ciphertext'}]}},{type:'compacted',payload:{replacement_history:[agentMessage,{type:'compaction',encrypted_content:'opaque-summary'}]}}];
+ const before=rows.map(r=>JSON.stringify(r)).join('\r\n')+'\r\n';await writeFile(file,before);
+ const result=await repairCodexHistory(h,id,{kind:'encoded-agent-message'});
+ expect(result).toMatchObject({files:1,removedIds:0,restoredMessages:2});
+ const expected=structuredClone(rows);
+ (expected[1]!.payload as typeof agentMessage).content[1]={type:'input_text',text:message};
+ ((expected[4]!.payload as {replacement_history:typeof agentMessage[]}).replacement_history[0]!).content[1]={type:'input_text',text:message};
+ const after=await readFile(file,'utf8');expect(after.trim().split('\r\n').map(l=>JSON.parse(l))).toEqual(expected);
+ expect(after.split('\r\n').map(l=>Buffer.byteLength(l))).toEqual(before.split('\r\n').map(l=>Buffer.byteLength(l)));
+ expect(await readFile(join(result.backupDir!,'sessions',name),'utf8')).toBe(before);
+ expect(await repairCodexHistory(h,id,{kind:'encoded-agent-message'})).toMatchObject({files:0,restoredMessages:0});
+});
+
+it.each(['c2a-msg-v1:%%%','c2a-msg-v1:/w==','c2a-msg-v1:YR=='])(
+ 'rejects invalid encoded agent content without rewriting the rollout: %s',async(encoded)=>{
+ const h=await fixture();const file=join(h,'sessions',name);
+ const before=[{type:'session_meta',payload:{id}},{type:'response_item',payload:{type:'agent_message',content:[{type:'encrypted_content',encrypted_content:encoded}]}}].map(r=>JSON.stringify(r)).join('\n')+'\n';
+ await writeFile(file,before);
+ await expect(repairCodexHistory(h,id,{kind:'encoded-agent-message'})).rejects.toThrow();
+ expect(await readFile(file,'utf8')).toBe(before);
+});

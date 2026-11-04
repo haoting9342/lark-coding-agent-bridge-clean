@@ -7,21 +7,22 @@ import type { AgentEvent } from '../../src/agent/types';
 const dirs:string[]=[];
 const id='01a06b52-faae-70e3-846c-cb51eb9d412a';
 afterEach(async()=>{await Promise.all(dirs.splice(0).map(d=>rm(d,{recursive:true,force:true})));});
-async function fixture(options:{repeat?:boolean;tool?:boolean;mcp?:boolean;otherError?:boolean;shared?:boolean;startedId?:string}={}){
+async function fixture(options:{repeat?:boolean;tool?:boolean;mcp?:boolean;otherError?:boolean;shared?:boolean;startedId?:string;encoded?:boolean;opaque?:boolean}={}){
  const root=await mkdtemp(join(tmpdir(),'history-recovery-'));dirs.push(root);
  const actualId=options.startedId ?? id;
  const home=join(root,options.shared?'shared':'provider-codex-home');await mkdir(join(home,'sessions'),{recursive:true});
  const file=join(home,'sessions',`rollout-${actualId}.jsonl`);const other=join(home,'sessions','unrelated.jsonl');await writeFile(other,'unreadable history must stay untouched');
- await writeFile(file,[{type:'session_meta',payload:{id:actualId}},{type:'response_item',payload:{id:'item_old',type:'reasoning',summary:[]}}].map(x=>JSON.stringify(x)).join('\n')+'\n');
+ const damaged=options.encoded?{type:'agent_message',content:[{type:'encrypted_content',encrypted_content:options.opaque?'real-ciphertext':'c2a-msg-v1:'+Buffer.from('子任务已完成').toString('base64')}]}:{id:'item_old',type:'reasoning',summary:[]};
+ await writeFile(file,[{type:'session_meta',payload:{id:actualId}},{type:'response_item',payload:damaged}].map(x=>JSON.stringify(x)).join('\n')+'\n');
  const binary=join(root,'fake.mjs');const records=join(root,'runs.jsonl');
- const failure=options.otherError?'rate limit':"Invalid 'input[39].id': 'item_old'. Expected an ID that begins with 'rs'.";
+ const failure=options.otherError?'rate limit':options.encoded?'stream disconnected before completion: Encrypted function output content could not be decrypted or decoded.':"Invalid 'input[39].id': 'item_old'. Expected an ID that begins with 'rs'.";
  await writeFile(binary,`#!/usr/bin/env node
 import {readFileSync,appendFileSync} from 'node:fs';
 let prompt='';for await(const x of process.stdin)prompt+=x;
 appendFileSync(${JSON.stringify(records)},JSON.stringify({prompt,args:process.argv.slice(2)})+'\\n');
 const rows=readFileSync(${JSON.stringify(file)},'utf8').trim().split('\\n').map(x=>JSON.parse(x));
 console.log(JSON.stringify({type:'thread.started',thread_id:${JSON.stringify(actualId)}}));
-if(rows[1].payload.id || ${!!options.repeat}){
+if(rows[1].payload.id || rows[1].payload.content?.some(x=>x.type==='encrypted_content') || ${!!options.repeat}){
  if(${!!options.mcp}) console.log(JSON.stringify({type:'item.completed',item:{type:'mcp_tool_call',id:'mcp'}}));
  if(${!!options.tool}) console.log(JSON.stringify({type:'item.started',item:{type:'command_execution',id:'tool',command:'test'}}));
  console.log(JSON.stringify({type:'turn.failed',error:{message:${JSON.stringify(failure)}}}));
@@ -54,4 +55,14 @@ for(const options of [{otherError:true},{tool:true},{mcp:true},{shared:true}])it
 it('stop during the recovery notice prevents the retry',async()=>{
  const h=await fixture();for await(const e of h.run.events){if(e.type==='text'&&e.delta.includes('修复')) await h.run.stop();}
  expect((await readFile(h.records,'utf8')).trim().split('\n')).toHaveLength(1);
+});
+it('repairs misencoded collaboration content and resumes the same thread with the original request',async()=>{
+ const h=await fixture({encoded:true});const events=await collect(h.run.events);
+ expect(events.some(e=>e.type==='error')).toBe(false);expect(events.at(-1)).toMatchObject({type:'done',threadId:id,terminationReason:'normal'});
+ const attempts=(await readFile(h.records,'utf8')).trim().split('\n').map(x=>JSON.parse(x));expect(attempts).toHaveLength(2);expect(attempts[0]).toEqual(attempts[1]);
+ expect(await readFile(h.file,'utf8')).toContain('子任务已完成');expect(await readFile(h.other,'utf8')).toBe('unreadable history must stay untouched');
+});
+for(const options of [{encoded:true,tool:true},{encoded:true,mcp:true},{encoded:true,opaque:true}])it(`does not erase opaque content or replay side effects ${JSON.stringify(options)}`,async()=>{
+ const h=await fixture(options);const events=await collect(h.run.events);expect(events.at(-1)).toMatchObject({type:'error'});await h.run.waitForExit(1000);
+ expect((await readFile(h.records,'utf8')).trim().split('\n')).toHaveLength(1);expect(await readFile(h.file,'utf8')).toContain('encrypted_content');
 });
